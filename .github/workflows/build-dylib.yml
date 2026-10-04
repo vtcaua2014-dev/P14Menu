@@ -36,4 +36,23 @@ jobs:
         run: codesign -f -s - build/P14Menu.dylib
 
       - name: Conferir o resultado
-        run:
+        run: |
+          file build/P14Menu.dylib
+          otool -L build/P14Menu.dylib
+          lipo -info build/P14Menu.dylib
+          ls -la build
+
+      - name: Montar pacote final
+        run: |
+          mkdir -p package
+          cp build/P14Menu.dylib package/
+          # Se você colocar os 4 dylibs originais na pasta "dylibs/" do repositório,
+          # eles entram junto no pacote.
+          if [ -d dylibs ]; then cp dylibs/*.dylib package/ || true; fi
+          ls -la package
+
+      - name: Enviar o .dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: P14Menu-dylib
+          path: package/*
