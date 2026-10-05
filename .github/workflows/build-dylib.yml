@@ -1,0 +1,53 @@
+name: Build P14Menu.dylib
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Baixar o código
+        uses: actions/checkout@v4
+
+      - name: Compilar P14Menu.dylib (arm64, iOS 13+)
+        run: |
+          mkdir -p build
+          xcrun --sdk iphoneos clang \
+            -arch arm64 \
+            -isysroot "$(xcrun --sdk iphoneos --show-sdk-path)" \
+            -miphoneos-version-min=13.0 \
+            -fobjc-arc \
+            -fvisibility=hidden \
+            -O2 \
+            -dynamiclib \
+            -framework UIKit \
+            -framework Foundation \
+            -framework CoreGraphics \
+            -framework QuartzCore \
+            -install_name @rpath/P14Menu.dylib \
+            -o build/P14Menu.dylib \
+            P14Menu.m
+
+      - name: Assinar
+        run: codesign -f -s - build/P14Menu.dylib
+
+      - name: Conferir o resultado
+        run: |
+          file build/P14Menu.dylib
+          ls -la build
+
+      - name: Montar pacote final
+        run: |
+          mkdir -p package
+          cp build/P14Menu.dylib package/
+          ls -la package
+
+      - name: Enviar o .dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: P14Menu-dylib
+          path: package/*
