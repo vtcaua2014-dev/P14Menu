@@ -28,6 +28,7 @@ jobs:
             -framework Foundation \
             -framework CoreGraphics \
             -framework QuartzCore \
+            -framework CoreText \
             -install_name @rpath/P14Menu.dylib \
             -o build/P14Menu.dylib \
             P14Menu.m
