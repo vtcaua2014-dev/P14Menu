@@ -1,0 +1,1 @@
+Coloque aqui LiveTimer.dylib, FZxc.dylib, Unlock_all.dylib e FloatingTimer.dylib (opcional, só para entrarem no pacote final).
