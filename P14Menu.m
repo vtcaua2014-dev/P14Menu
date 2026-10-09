@@ -9,8 +9,8 @@
 //    - Floating Clock (código embutido, ex-FloatingTimer.m)
 //    - IOSTimer      (código embutido, ex-IOSTimer.m; fonte DS-Digital embutida via DSDigital.h)
 //    - FPS Counter   (novo módulo embutido: contador de FPS arrastável, independente dos outros)
-//    - D-Pad         (módulo embutido: controle visual via UIKit; publica
-//                      notificações de direção para integração em um jogo próprio)
+//    - D-Pad         (novo módulo embutido: 4 setas que simulam arrasto via API privada
+//                      IOHIDEventSystemClient, carregada por dlopen/dlsym — EXPERIMENTAL)
 //    - PiP Float     (código embutido, ex-PiPFloat.m; não liga sozinho — só via Ativar/Desativar)
 //    - VTimer        (novo módulo embutido: cronômetro com botões + toques, menu de
 //                      cor de fundo/cor da fonte/8 fontes/foto de fundo; não liga sozinho)
@@ -2466,11 +2466,396 @@ static void P14VTimerStop(void) {
 // ====================================================================
 // AVISO IMPORTANTE SOBRE ESTE MÓDULO
 // --------------------------------------------------------------------
-// D-Pad com API pública.
-// Este componente desenha o controle e publica a direção pressionada através
-// de NSNotificationCenter. Um jogo próprio pode escutar a notificação e mover
-// seu personagem. Um jogo de terceiros não receberá automaticamente esses
-// comandos: o iOS não oferece uma API pública geral para injetar toques nele.
+// O D-Pad simula um arrasto na tela usando IOHIDEventSystemClient, uma
+// API PRIVADA e não documentada do iOS (não existe no SDK público, por
+// isso os tipos e funções abaixo são declarados manualmente). Ela é a
+// mesma família de API usada por ferramentas de automação de toque em
+// jailbreak. Como não dá para testar isso num iPhone de verdade aqui,
+// os nomes e valores abaixo vêm de engenharia reversa já conhecida da
+// comunidade, não de documentação oficial — podem precisar de ajuste
+// por versão de iOS, ou simplesmente não funcionar em algum aparelho.
+// Por segurança, tudo é carregado com dlopen/dlsym: se algum símbolo
+// não existir, o D-Pad avisa em vez de travar o app.
+// ====================================================================
+
+typedef struct __IOHIDEvent *P14HIDEventRef;
+typedef struct __IOHIDEventSystemClient *P14HIDClientRef;
+
+// O "AbsoluteTime" que essas funções esperam é uma struct de 8 bytes (não
+// um uint64_t), vinda do Carbon/IOKit antigo. Em código de referência que
+// funciona de verdade (tweak SimulateTouch, de iolate), ela é só o mesmo
+// carimbo de tempo de mach_absolute_time() reinterpretado byte a byte:
+//   AbsoluteTime timeStamp = *(AbsoluteTime *) &abTime;
+// Replicamos exatamente esse layout aqui.
+typedef struct { uint32_t hi; uint32_t lo; } P14HIDAbsoluteTime;
+
+static P14HIDAbsoluteTime P14HIDNow(void) {
+    uint64_t now = mach_absolute_time();
+    P14HIDAbsoluteTime t;
+    memcpy(&t, &now, sizeof(t));
+    return t;
+}
+
+typedef P14HIDClientRef (*P14HIDClientCreateFn)(CFAllocatorRef allocator);
+
+// Evento "mão" (nível superior, que carrega um ou mais dedos dentro dele).
+typedef P14HIDEventRef (*P14HIDDigitizerEventCreateFn)(CFAllocatorRef allocator,
+                                                        P14HIDAbsoluteTime timeStamp,
+                                                        uint32_t type,
+                                                        uint32_t index,
+                                                        uint32_t identity,
+                                                        uint32_t eventMask,
+                                                        uint32_t buttonMask,
+                                                        double x,
+                                                        double y,
+                                                        double z,
+                                                        double tipPressure,
+                                                        double barrelPressure,
+                                                        Boolean range,
+                                                        Boolean touch,
+                                                        uint32_t options);
+
+// Evento "dedo" (vai dentro do evento "mão" acima). É uma função DIFERENTE
+// da de cima — no código original eu tinha usado a mesma função pras duas
+// coisas, o que estava errado.
+typedef P14HIDEventRef (*P14HIDFingerEventCreateFn)(CFAllocatorRef allocator,
+                                                     P14HIDAbsoluteTime timeStamp,
+                                                     uint32_t index,
+                                                     uint32_t identity,
+                                                     uint32_t eventMask,
+                                                     double x,
+                                                     double y,
+                                                     double z,
+                                                     double tipPressure,
+                                                     double twist,
+                                                     double minorRadius,
+                                                     double majorRadius,
+                                                     double quality,
+                                                     double density,
+                                                     double irregularity,
+                                                     Boolean range,
+                                                     Boolean touch,
+                                                     uint32_t options);
+
+typedef void (*P14HIDAppendEventFn)(P14HIDEventRef parent, P14HIDEventRef child, uint32_t options);
+typedef void (*P14HIDSetSenderIDFn)(P14HIDEventRef event, uint64_t senderID);
+typedef void (*P14HIDDispatchFn)(P14HIDClientRef client, P14HIDEventRef event);
+typedef void (*P14HIDSetIntegerValueFn)(P14HIDEventRef event, uint32_t field, int32_t value, int32_t options);
+
+// Valores confirmados pelo código de referência (tweak SimulateTouch) e
+// pelo cabeçalho IOHIDEvent.h que vieram junto.
+static const uint32_t kP14HIDDigitizerTypeHand   = 3; // iOS 7 em diante
+static const uint32_t kP14HIDDigitizerEventRange    = 1 << 0;
+static const uint32_t kP14HIDDigitizerEventTouch    = 1 << 1;
+static const uint32_t kP14HIDDigitizerEventPosition = 1 << 2;
+static const uint32_t kP14HIDDigitizerEventIdentity = 1 << 5;
+
+// Campos do evento, para IOHIDEventSetIntegerValueWithOptions.
+// Os dois primeiros vieram DIRETO do IOHIDEventTypes7.h que você mandou
+// (valor confirmado, não é chute). Os três de baixo (EventMask/Range/Touch)
+// eu reconstruí calculando a partir da mesma fórmula confirmada por esse
+// arquivo (campo = (tipo do evento << 16) + posição do campo na lista) —
+// tenho boa confiança neles porque batem com valores que já vi citados em
+// outros códigos públicos, mas, ao contrário dos dois primeiros, não vieram
+// escritos literalmente em nenhum arquivo que você me mandou.
+static const uint32_t kP14HIDFieldDisplayIntegrated   = 720921; // confirmado (IOHIDEventTypes7.h)
+static const uint32_t kP14HIDFieldBuiltIn             = 4;      // confirmado (IOHIDEventTypes7.h)
+static const uint32_t kP14HIDFieldDigitizerEventMask  = 720903; // reconstruído (11<<16 + 7)
+static const uint32_t kP14HIDFieldDigitizerRange      = 720904; // reconstruído (11<<16 + 8)
+static const uint32_t kP14HIDFieldDigitizerTouch      = 720905; // reconstruído (11<<16 + 9)
+// ID do remetente do evento "mão". O comentário do código original diz que
+// o valor exato não importa muito, contanto que não seja zero.
+static const uint64_t kP14HIDHandSenderID = 0x000000010000027FULL;
+
+typedef struct {
+    P14HIDClientRef client;
+    P14HIDClientCreateFn clientCreate;
+    P14HIDDigitizerEventCreateFn digitizerCreate;
+    P14HIDFingerEventCreateFn fingerCreate;
+    P14HIDAppendEventFn appendEvent;
+    P14HIDSetSenderIDFn setSenderID;
+    P14HIDDispatchFn dispatch;
+    P14HIDSetIntegerValueFn setIntegerValue; // opcional — se faltar, seguimos sem esses campos extras
+    BOOL ready;
+    BOOL attempted;
+    char failReason[200]; // para o aviso dizer exatamente onde travou
+} P14HIDBridge;
+
+static P14HIDBridge *P14HIDBridgeShared(void) {
+    static P14HIDBridge bridge;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        bridge.attempted = YES;
+
+        // Em versões recentes do iOS, a maioria dos frameworks privados não
+        // existe mais como arquivo separado no disco — só dentro do cache
+        // compartilhado do sistema. Nesse caso dlopen(caminho) falha com
+        // "no such file", mesmo o framework estando carregado de verdade na
+        // memória do processo (puxado por algum outro framework público,
+        // como o próprio UIKit). Por isso, se o dlopen pelo caminho falhar,
+        // tentamos achar os mesmos símbolos já residentes no processo
+        // (RTLD_DEFAULT) antes de desistir.
+        void *handle = dlopen("/System/Library/PrivateFrameworks/IOKit.framework/IOKit", RTLD_NOW);
+        BOOL usingFallback = NO;
+        NSString *openErrorMessage = nil;
+
+        if (!handle) {
+            const char *err = dlerror();
+            openErrorMessage = [NSString stringWithUTF8String:(err ? err : "sem detalhe")];
+            handle = RTLD_DEFAULT;
+            usingFallback = YES;
+        }
+
+        bridge.clientCreate = (P14HIDClientCreateFn)dlsym(handle, "IOHIDEventSystemClientCreate");
+        bridge.digitizerCreate = (P14HIDDigitizerEventCreateFn)dlsym(handle, "IOHIDEventCreateDigitizerEvent");
+        bridge.fingerCreate = (P14HIDFingerEventCreateFn)dlsym(handle, "IOHIDEventCreateDigitizerFingerEventWithQuality");
+        bridge.appendEvent = (P14HIDAppendEventFn)dlsym(handle, "IOHIDEventAppendEvent");
+        bridge.setSenderID = (P14HIDSetSenderIDFn)dlsym(handle, "IOHIDEventSetSenderID");
+        bridge.dispatch = (P14HIDDispatchFn)dlsym(handle, "IOHIDEventSystemClientDispatchEvent");
+        // Opcional: se este não existir, o D-Pad ainda tenta funcionar sem
+        // marcar os campos extras (display integrado, máscara da mão etc.),
+        // só com uma chance um pouco menor de o sistema aceitar o toque.
+        bridge.setIntegerValue = (P14HIDSetIntegerValueFn)dlsym(handle, "IOHIDEventSetIntegerValueWithOptions");
+
+        NSMutableArray<NSString *> *missing = [NSMutableArray array];
+        if (!bridge.clientCreate) [missing addObject:@"IOHIDEventSystemClientCreate"];
+        if (!bridge.digitizerCreate) [missing addObject:@"IOHIDEventCreateDigitizerEvent"];
+        if (!bridge.fingerCreate) [missing addObject:@"IOHIDEventCreateDigitizerFingerEventWithQuality"];
+        if (!bridge.appendEvent) [missing addObject:@"IOHIDEventAppendEvent"];
+        if (!bridge.setSenderID) [missing addObject:@"IOHIDEventSetSenderID"];
+        if (!bridge.dispatch) [missing addObject:@"IOHIDEventSystemClientDispatchEvent"];
+
+        if (missing.count > 0) {
+            NSString *joined = [missing componentsJoinedByString:@", "];
+            if (usingFallback) {
+                snprintf(bridge.failReason, sizeof(bridge.failReason),
+                         "dlopen falhou (%s) e símbolo(s) também não estavam carregados no processo: %s",
+                         openErrorMessage.UTF8String, joined.UTF8String);
+            } else {
+                snprintf(bridge.failReason, sizeof(bridge.failReason),
+                         "símbolo(s) não encontrado(s): %s", joined.UTF8String);
+            }
+            return;
+        }
+
+        bridge.client = bridge.clientCreate(kCFAllocatorDefault);
+        bridge.ready = (bridge.client != NULL);
+        if (!bridge.ready) {
+            snprintf(bridge.failReason, sizeof(bridge.failReason),
+                     "IOHIDEventSystemClientCreate retornou nulo (provável bloqueio de sandbox/entitlement)%s",
+                     usingFallback ? " — símbolos achados via fallback no processo" : "");
+        }
+    });
+    return &bridge;
+}
+
+// Converte um ponto da tela (em pontos, o sistema de coordenadas normal do
+// UIKit) para o formato que o IOHIDEvent realmente espera: uma fração de
+// 0 a 1 da tela, multiplicada pela escala do aparelho (@2x, @3x). Isso veio
+// direto do código de referência — eu não sabia disso antes, e é bem
+// provável que seja o motivo do toque não ter feito nada: eu estava
+// passando o ponto em pontos (ex.: 190) direto, quando era esperado um
+// valor bem menor (ex.: ~1.4).
+static CGPoint P14HIDNormalizedPoint(CGPoint point) {
+    // O código de referência mede a tela em PIXELS (via CAWindowServer) e
+    // multiplica pela escala (2x/3x) depois de dividir — só que, nas contas,
+    // o "pixels ÷ escala" dele dá exatamente o mesmo resultado que "pontos"
+    // puro, sem multiplicar por nada. Usando UIScreen.mainScreen.bounds (que
+    // já vem em pontos), o jeito certo é só dividir, SEM multiplicar pela
+    // escala de novo — isso é o que corrigimos aqui.
+    CGRect screen = UIScreen.mainScreen.bounds;
+    CGFloat width = screen.size.width;
+    CGFloat height = screen.size.height;
+    if (width <= 0 || height <= 0) return CGPointZero;
+    return CGPointMake(point.x / width, point.y / height);
+}
+
+typedef NS_ENUM(NSInteger, P14HIDTouchPhase) {
+    P14HIDTouchMove = 0, // dedo já encostado, só mudando de posição
+    P14HIDTouchDown,     // dedo encostando agora
+    P14HIDTouchUp,       // dedo levantando
+};
+
+// Envia um único "frame" de toque (dedo descendo, se movendo, ou
+// levantando) na posição dada. Segue a mesma sequência do SendTouchesEvent
+// do SimulateTouch (iolate): o evento "mão" nasce zerado (só com a
+// identidade), o "dedo" é quem carrega a posição de verdade, e DEPOIS de
+// anexar o dedo é que a máscara/alcance/toque da mão são setados via
+// IOHIDEventSetIntegerValueWithOptions — não na criação.
+static void P14HIDSendTouchFrame(CGPoint rawPoint, P14HIDTouchPhase phase, uint32_t identity) {
+    P14HIDBridge *bridge = P14HIDBridgeShared();
+    if (!bridge->ready) return;
+
+    P14HIDAbsoluteTime now = P14HIDNow();
+    CGPoint p = P14HIDNormalizedPoint(rawPoint);
+
+    uint32_t fingerMask = (phase == P14HIDTouchMove)
+        ? kP14HIDDigitizerEventPosition
+        : (kP14HIDDigitizerEventRange | kP14HIDDigitizerEventTouch);
+
+    BOOL touching = (phase != P14HIDTouchUp);
+
+    // Mão: nasce zerada — só a identidade (1) é real na criação. A posição
+    // de verdade vai só no dedo, nunca na mão.
+    P14HIDEventRef hand = bridge->digitizerCreate(kCFAllocatorDefault,
+                                                   now,
+                                                   kP14HIDDigitizerTypeHand,
+                                                   0,  // index
+                                                   1,  // identity
+                                                   0,  // eventMask (setado depois)
+                                                   0,  // buttonMask
+                                                   0, 0, 0,
+                                                   0, 0,
+                                                   0, 0,
+                                                   0);
+    if (!hand) return;
+
+    if (bridge->setIntegerValue) {
+        bridge->setIntegerValue(hand, kP14HIDFieldDisplayIntegrated, 1, -268435456);
+        bridge->setIntegerValue(hand, kP14HIDFieldBuiltIn, 1, -268435456);
+    }
+
+    // Dedo: função específica para isso (IOHIDEventCreateDigitizerFingerEventWithQuality),
+    // não a genérica de "mão". Leva a posição normalizada de verdade.
+    P14HIDEventRef finger = bridge->fingerCreate(kCFAllocatorDefault,
+                                                  now,
+                                                  0,            // index
+                                                  identity + 2, // identity (código de referência soma 2)
+                                                  fingerMask,
+                                                  p.x, p.y, 0,
+                                                  0,            // tipPressure
+                                                  0,            // twist
+                                                  0, 0, 0, 0, 0, // raio/qualidade/densidade/irregularidade
+                                                  touching, touching,
+                                                  0);
+    if (!finger) {
+        CFRelease((CFTypeRef)hand);
+        return;
+    }
+
+    bridge->appendEvent(hand, finger, 0);
+
+    // Só depois de anexar o dedo é que a mão recebe sua própria máscara —
+    // handEventMask/handEventTouch no código de referência são acumulados
+    // entre vários dedos; como só usamos um dedo por vez, usamos direto os
+    // valores desse único toque.
+    if (bridge->setIntegerValue) {
+        uint32_t handMask = (phase == P14HIDTouchMove)
+            ? kP14HIDDigitizerEventPosition
+            : (kP14HIDDigitizerEventRange | kP14HIDDigitizerEventTouch | kP14HIDDigitizerEventIdentity);
+        if (phase == P14HIDTouchUp) handMask |= kP14HIDDigitizerEventPosition;
+
+        bridge->setIntegerValue(hand, kP14HIDFieldDigitizerEventMask, handMask, -268435456);
+        bridge->setIntegerValue(hand, kP14HIDFieldDigitizerRange, touching, -268435456);
+        bridge->setIntegerValue(hand, kP14HIDFieldDigitizerTouch, touching, -268435456);
+    }
+
+    bridge->setSenderID(hand, kP14HIDHandSenderID);
+
+    // Avisa o sistema que houve interação real do usuário agora — presente
+    // no código de referência, nome do método muda conforme a versão do iOS.
+    Class timerClass = NSClassFromString(@"BKUserEventTimer");
+    id timer = [timerClass respondsToSelector:@selector(sharedInstance)]
+        ? [timerClass performSelector:@selector(sharedInstance)]
+        : nil;
+    if ([timer respondsToSelector:@selector(userEventOccurred)]) {
+        [timer performSelector:@selector(userEventOccurred)];
+    } else if ([timer respondsToSelector:@selector(userEventOccurredOnDisplay:)]) {
+        [timer performSelector:@selector(userEventOccurredOnDisplay:) withObject:nil];
+    }
+
+    bridge->dispatch(bridge->client, hand);
+
+    CFRelease((CFTypeRef)finger);
+    CFRelease((CFTypeRef)hand);
+}
+
+// Aviso autossuficiente (não depende da classe do menu) caso a API
+// privada de toque não esteja disponível neste aparelho/versão do iOS.
+static void P14DPadShowWarningWithReason(NSString *reason) {
+    static BOOL shown = NO;
+    if (shown) return;
+    shown = YES;
+
+    UIWindowScene *scene = P14ForegroundWindowScene();
+    if (!scene) return;
+
+    CGRect screen = UIScreen.mainScreen.bounds;
+    P14Window *w = [[P14Window alloc] initWithWindowScene:scene];
+    w.frame = screen;
+    w.windowLevel = UIWindowLevelAlert + 200;
+    w.backgroundColor = UIColor.clearColor;
+
+    UIViewController *vc = [UIViewController new];
+    vc.view.backgroundColor = UIColor.clearColor;
+    w.rootViewController = vc;
+    w.hidden = NO;
+    [P14EmbeddedWindows() addObject:w];
+
+    UILabel *label = [UILabel new];
+    label.text = reason
+        ? [NSString stringWithFormat:@"  D-Pad: %@  ", reason]
+        : @"  D-Pad: não consegui acessar o toque simulado neste aparelho  ";
+    label.textColor = UIColor.whiteColor;
+    label.backgroundColor = [UIColor colorWithWhite:0.05 alpha:0.9];
+    label.font = [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
+    label.numberOfLines = 0;
+    label.textAlignment = NSTextAlignmentCenter;
+    label.layer.cornerRadius = 12;
+    label.clipsToBounds = YES;
+
+    CGFloat maxW = screen.size.width - 40;
+    CGSize fit = [label sizeThatFits:CGSizeMake(maxW, 200)];
+    label.frame = CGRectMake((screen.size.width - MIN(fit.width, maxW)) / 2.0,
+                             w.safeAreaInsets.top + 12.0,
+                             MIN(fit.width, maxW),
+                             fit.height + 16.0);
+    label.alpha = 0;
+    [vc.view addSubview:label];
+
+    [UIView animateWithDuration:0.25 animations:^{ label.alpha = 1; }];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [UIView animateWithDuration:0.3 animations:^{ label.alpha = 0; } completion:^(BOOL f) {
+            w.hidden = YES;
+            w.rootViewController = nil;
+        }];
+    });
+}
+
+// Simula um arrasto rápido de "from" até "to", com alguns passos
+// intermediários, terminando com o dedo levantando.
+static void P14HIDSimulateSwipe(CGPoint from, CGPoint to) {
+    P14HIDBridge *bridge = P14HIDBridgeShared();
+    if (!bridge->ready) {
+        NSString *reason = bridge->failReason[0] ? [NSString stringWithUTF8String:bridge->failReason] : nil;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            P14DPadShowWarningWithReason(reason);
+        });
+        return;
+    }
+
+    static uint32_t identityCounter = 1000;
+    uint32_t identity = ++identityCounter;
+
+    const NSInteger steps = 6;
+    const NSTimeInterval stepDelay = 0.012;
+
+    P14HIDSendTouchFrame(from, P14HIDTouchDown, identity);
+
+    for (NSInteger i = 1; i <= steps; i++) {
+        CGFloat t = (CGFloat)i / (CGFloat)steps;
+        CGPoint p = CGPointMake(from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(stepDelay * i * NSEC_PER_SEC)),
+                        dispatch_get_main_queue(), ^{
+            P14HIDSendTouchFrame(p, P14HIDTouchMove, identity);
+        });
+    }
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(stepDelay * (steps + 1) * NSEC_PER_SEC)),
+                    dispatch_get_main_queue(), ^{
+        P14HIDSendTouchFrame(to, P14HIDTouchUp, identity);
+    });
+}
 
 typedef NS_ENUM(NSInteger, P14DPadDirection) {
     P14DPadUp = 0,
@@ -2479,25 +2864,34 @@ typedef NS_ENUM(NSInteger, P14DPadDirection) {
     P14DPadRight,
 };
 
-static NSString *const P14DPadDirectionNotification =
-    @"P14DPadDirectionNotification";
-
 static void P14DPadFire(P14DPadDirection direction) {
-    NSString *value = @"up";
+    CGRect screen = UIScreen.mainScreen.bounds;
+    CGPoint center = CGPointMake(screen.size.width / 2.0, screen.size.height / 2.0);
+    CGFloat reach = MIN(screen.size.width, screen.size.height) * 0.28;
+
+    CGPoint from = center;
+    CGPoint to = center;
 
     switch (direction) {
-        case P14DPadUp:    value = @"up";    break;
-        case P14DPadDown:  value = @"down";  break;
-        case P14DPadLeft:  value = @"left";  break;
-        case P14DPadRight: value = @"right"; break;
+        case P14DPadUp:
+            from = CGPointMake(center.x, center.y + reach / 2.0);
+            to   = CGPointMake(center.x, center.y - reach);
+            break;
+        case P14DPadDown:
+            from = CGPointMake(center.x, center.y - reach / 2.0);
+            to   = CGPointMake(center.x, center.y + reach);
+            break;
+        case P14DPadLeft:
+            from = CGPointMake(center.x + reach / 2.0, center.y);
+            to   = CGPointMake(center.x - reach, center.y);
+            break;
+        case P14DPadRight:
+            from = CGPointMake(center.x - reach / 2.0, center.y);
+            to   = CGPointMake(center.x + reach, center.y);
+            break;
     }
 
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [[NSNotificationCenter defaultCenter]
-            postNotificationName:P14DPadDirectionNotification
-                          object:nil
-                        userInfo:@{@"direction": value}];
-    });
+    P14HIDSimulateSwipe(from, to);
 }
 
 #pragma mark D-Pad: visual
@@ -2847,8 +3241,9 @@ static __weak P14Menu *gMenu;
     vtimer.startBlock = ^{ P14VTimerStart(); };
     vtimer.stopBlock = ^{ P14VTimerStop(); };
 
-    // D-Pad: controle visual com UIKit. Publica notificações de direção;
-    // um jogo próprio pode escutá-las. Não injeta toques no sistema.
+    // D-Pad: 4 setas que simulam um arrasto na tela (toque sintético via API
+    // privada do iOS). Independente dos cronômetros — não entra na
+    // exclusividade e não liga sozinho.
     P14Module *dpad = P14MakeModule(@"D-Pad", nil, NO, NO);
     dpad.startBlock = ^{ P14DPadStart(); };
     dpad.stopBlock = ^{ P14DPadStop(); };
